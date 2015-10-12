@@ -1,0 +1,89 @@
+#!/bin/python 
+#vim: set fileencoding=utf-8
+#
+# MIT 2015 - podvody@redhat.com
+#
+import argparse, koji, librepo, gzip, six, sys, tempfile
+from lxml import etree as ET
+from pprint import pprint
+from copr.client import CoprClient
+
+XMLNS = {'common': 'http://linux.duke.edu/metadata/common', 'rpm': 'http://linux.duke.edu/metadata/rpm'}
+PROGRESSBAR_LEN = 50
+
+arg = argparse.ArgumentParser()
+arg.add_argument('--copr-user', default='')
+arg.add_argument('--koji-package', default='vim')
+args = arg.parse_args()
+
+if not args.copr_user:
+  print(" ** Please provide --copr-user parameter")
+  sys.exit(1)
+
+def callback(data, total_to_download, downloaded):
+  """Progress callback"""
+  if total_to_download <= 0:
+    return
+  completed = int(downloaded / (total_to_download / PROGRESSBAR_LEN))
+  print "[%s%s] %8s/%8s (%s)\r" % ('#'*completed, '-'*(PROGRESSBAR_LEN-completed), int(downloaded), int(total_to_download), data),
+  sys.stdout.flush()
+
+def download_repo(repos):
+  h, r = librepo.Handle(), librepo.Result()
+  tmpdir = tempfile.mkdtemp()
+  h.setopt(librepo.LRO_URLS, [repos])
+  h.setopt(librepo.LRO_REPOTYPE, librepo.LR_YUMREPO)
+  h.setopt(librepo.LRO_PROGRESSCB, callback)
+  h.setopt(librepo.LRO_PROGRESSDATA, repos)
+  h.setopt(librepo.LRO_DESTDIR, tmpdir)
+  h.setopt(librepo.LRO_INTERRUPTIBLE, True)
+  h.setopt(librepo.LRO_CHECKSUM, True)
+  h.setopt(librepo.LRO_YUMDLIST, ["primary"])
+  try:
+    h.perform(r)
+    return r.getinfo(librepo.LRR_YUM_REPO)
+  except librepo.LibrepoException:
+    return None
+
+def pkgxml_get_version(pkg):
+  arch = pkg.find('common:arch', XMLNS).text
+  verattr = pkg.find('common:version', XMLNS).attrib
+  return {'arch': arch, 
+    'epoch': verattr['epoch'], 
+    'version': verattr['ver'], 
+    'release': verattr['rel']}
+
+print('COPR repositories:')
+
+cl = CoprClient.create_from_file_config()
+result = cl.get_projects_list(username=args.copr_user)
+repos = set()
+
+for proj in result.projects_list:
+  for repo in six.itervalues(proj.handle.get_project_details().data['detail']['yum_repos']):
+    repos.add(repo)
+
+print('  ' + '\n  '.join(repos))
+
+for r in repos:
+  repodata = download_repo(r)
+  if repodata == None:
+    continue
+
+  repofilesxml = repodata['primary']
+  unzipped = gzip.GzipFile(filename=repofilesxml)
+  tree = ET.parse(unzipped)
+  root = tree.getroot()
+  for pkg in root.findall('common:package', XMLNS):
+    print(pkg.find('common:name', XMLNS).text)
+    #print(pkgxml_get_version(pkg))
+
+print('\nEstablishing Koji session ... ')
+koji_session = koji.ClientSession('http://koji.fedoraproject.org/kojihub')
+# print(koji_session.krb_login()) # blows!
+
+print(' querying package "vim"')
+pkgs = koji_session.listPackages(prefix=args.koji_package)
+print(' querying 5 latest builds for {} pkg_id={}'.format(pkgs[0]['package_name'], pkgs[0]['package_id']))
+rrpm = koji_session.listBuilds(pkgs[0]['package_id'])
+print('  ' + '\n  '.join([x['nvr'] for x in rrpm][:5]))
